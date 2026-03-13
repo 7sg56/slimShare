@@ -1,65 +1,269 @@
-import Image from "next/image";
+"use client";
+
+import { useEffect, useState, useRef } from "react";
+import ConnectionManager from "@/components/ConnectionManager";
+import SharingInterface, { SharedItem } from "@/components/SharingInterface";
+import type { DataConnection, Peer as PeerType } from "peerjs";
+
+export type ConnectionStatus = "idle" | "connecting" | "connected" | "error";
+
+function generateShortId() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let id = "";
+  for (let i = 0; i < 6; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return id;
+}
 
 export default function Home() {
+  const [peerId, setPeerId] = useState<string | null>(null);
+  const [connection, setConnection] = useState<DataConnection | null>(null);
+  const [items, setItems] = useState<SharedItem[]>([]);
+  const [connStatus, setConnStatus] = useState<ConnectionStatus>("idle");
+  const [connError, setConnError] = useState<string | null>(null);
+  const peerRef = useRef<PeerType | null>(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function clearTimer() {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }
+
+  function goConnected(conn: DataConnection) {
+    clearTimer();
+    console.log("[SlimShare] ✅ CONNECTED to", conn.peer);
+    setConnStatus("connected");
+    setConnError(null);
+    setConnection(conn);
+  }
+
+  function goDisconnected() {
+    clearTimer();
+    console.log("[SlimShare] Disconnected, back to idle");
+    setConnection(null);
+    setConnStatus("idle");
+    setConnError(null);
+    setItems([]);
+  }
+
+  function wireConnection(conn: DataConnection) {
+    console.log("[SlimShare] Wiring connection, open?", conn.open);
+
+    // CRITICAL: If the connection is already open (fast local network),
+    // go straight to connected state instead of waiting for the "open" event
+    if (conn.open) {
+      goConnected(conn);
+    }
+
+    conn.on("open", () => {
+      goConnected(conn);
+    });
+
+    conn.on("data", (data: unknown) => {
+      console.log("[SlimShare] Got data");
+      setItems((prev) => [...prev, data as SharedItem]);
+    });
+
+    conn.on("close", () => {
+      goDisconnected();
+    });
+
+    conn.on("error", (err) => {
+      console.error("[SlimShare] Connection error:", err);
+      clearTimer();
+      setConnStatus("error");
+      setConnError("Connection dropped. Try again.");
+    });
+  }
+
+  useEffect(() => {
+    let destroyed = false;
+
+    import("peerjs").then(({ default: Peer }) => {
+      if (destroyed) return;
+
+      function createPeer(id: string, attempt = 0) {
+        if (attempt > 3) {
+          setConnStatus("error");
+          setConnError("Could not register with server. Refresh the page.");
+          return;
+        }
+
+        console.log("[SlimShare] Creating peer with ID:", id);
+        const peer = new Peer(id, {
+          host: window.location.hostname,
+          port: Number(window.location.port) || (window.location.protocol === "https:" ? 443 : 80),
+          path: "/api/peerjs",
+          secure: window.location.protocol === "https:",
+          debug: 2,
+          config: {
+            iceServers: [
+              { urls: "stun:stun.l.google.com:19302" },
+              { urls: "stun:stun1.l.google.com:19302" },
+            ],
+          },
+        });
+
+        peer.on("open", (assignedId) => {
+          console.log("[SlimShare] ✅ Registered with server as:", assignedId);
+          setPeerId(assignedId);
+        });
+
+        // Auto-reconnect if we lose connection to signaling server
+        peer.on("disconnected", () => {
+          console.log("[SlimShare] Lost connection to signaling server, reconnecting...");
+          if (!peer.destroyed) {
+            peer.reconnect();
+          }
+        });
+
+        peer.on("error", (err) => {
+          console.error("[SlimShare] Peer error:", err.type, err.message);
+
+          if (err.type === "unavailable-id") {
+            peer.destroy();
+            createPeer(generateShortId(), attempt + 1);
+            return;
+          }
+
+          if (err.type === "peer-unavailable") {
+            clearTimer();
+            setConnStatus("error");
+            setConnError("No one online with that code. Double-check and try again.");
+            return;
+          }
+
+          // For "disconnected" type errors, try to reconnect
+          if (err.type === "disconnected" && !peer.destroyed) {
+            peer.reconnect();
+            return;
+          }
+
+          setConnStatus("error");
+          setConnError(`Error: ${err.message || err.type}`);
+        });
+
+        peer.on("connection", (incomingConn) => {
+          console.log("[SlimShare] 📞 Incoming connection from:", incomingConn.peer);
+          setConnStatus("connecting");
+          wireConnection(incomingConn);
+        });
+
+        peerRef.current = peer;
+      }
+
+      createPeer(generateShortId());
+    });
+
+    return () => {
+      destroyed = true;
+      clearTimer();
+      peerRef.current?.destroy();
+    };
+  }, []);
+
+  const connectToPeer = (targetId: string) => {
+    const peer = peerRef.current;
+    if (!peer || peer.destroyed) {
+      setConnStatus("error");
+      setConnError("Not ready yet. Refresh the page and try again.");
+      return;
+    }
+
+    // If peer got disconnected from signaling server, reconnect first
+    if (peer.disconnected) {
+      console.log("[SlimShare] Peer was disconnected, reconnecting first...");
+      peer.reconnect();
+    }
+
+    console.log("[SlimShare] 📞 Connecting to:", targetId);
+    setConnStatus("connecting");
+    setConnError(null);
+
+    const conn = peer.connect(targetId.trim());
+    wireConnection(conn);
+
+    timeoutRef.current = setTimeout(() => {
+      if (!conn.open) {
+        console.log("[SlimShare] ⏰ Timed out");
+        conn.close();
+        setConnection(null);
+        setConnStatus("error");
+        setConnError("Timed out. Make sure the other device is online.");
+      }
+    }, 12000);
+  };
+
+  const handleDisconnect = () => {
+    clearTimer();
+    connection?.close();
+    setConnection(null);
+    setConnStatus("idle");
+    setConnError(null);
+    setItems([]);
+  };
+
+  const handleSendText = (text: string, isPassword: boolean) => {
+    if (!connection?.open) return;
+    const newItem: SharedItem = {
+      id: crypto.randomUUID(),
+      type: isPassword ? "password" : "text",
+      content: text,
+      timestamp: Date.now(),
+      isSender: true,
+    };
+    setItems((prev) => [...prev, newItem]);
+    connection.send({ ...newItem, isSender: false });
+  };
+
+  const handleSendFile = (file: File) => {
+    if (!connection?.open) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const metadata = e.target?.result as ArrayBuffer;
+      const newItem: SharedItem = {
+        id: crypto.randomUUID(),
+        type: "file",
+        content: file.name,
+        metadata,
+        timestamp: Date.now(),
+        isSender: true,
+      };
+      setItems((prev) => [...prev, newItem]);
+      connection.send({ ...newItem, isSender: false });
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const isConnected = connStatus === "connected" && connection !== null;
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main className="min-h-screen py-12 px-4 sm:px-6 lg:px-8 flex items-center justify-center relative overflow-hidden">
+      <div className="absolute top-0 inset-x-0 h-40 bg-gradient-to-b from-[var(--color-primary-600)]/20 to-transparent pointer-events-none" />
+      <div className="absolute bottom-0 inset-x-0 h-40 bg-gradient-to-t from-[var(--color-secondary-600)]/20 to-transparent pointer-events-none" />
+
+      <div className="w-full z-10">
+        {!isConnected ? (
+          <ConnectionManager
+            peerId={peerId}
+            onConnect={connectToPeer}
+            status={connStatus}
+            error={connError}
+            onRetry={() => { setConnStatus("idle"); setConnError(null); }}
+          />
+        ) : (
+          <SharingInterface
+            peerId={connection.peer}
+            items={items}
+            onSendText={handleSendText}
+            onSendFile={handleSendFile}
+            onDisconnect={handleDisconnect}
+          />
+        )}
+      </div>
+    </main>
   );
 }
